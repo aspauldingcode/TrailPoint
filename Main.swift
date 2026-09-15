@@ -317,10 +317,15 @@ final class SettingsPanelController {
     private let panel: NSPanel
 
     init(store: SettingsStore) {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
-        panel.title = "TrailPoint — Pointer Options"
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow, .fullSizeContentView], backing: .buffered, defer: false)
+        panel.title = "Mouse Properties"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.moveToActiveSpace]
         panel.contentView = NSHostingView(rootView: PointerOptionsView(store: store, close: { [weak panel] in panel?.close() }))
     }
@@ -337,51 +342,120 @@ struct PointerOptionsView: View {
     }
 
     var body: some View {
-        VStack(spacing: 10) {
-            GroupBox("Motion") {
-                HStack(alignment: .top, spacing: 14) {
-                    Image(systemName: "cursorarrow.motionlines").font(.system(size: 25)).foregroundStyle(.secondary).frame(width: 38, height: 60)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Select a pointer speed:")
-                        HStack(spacing: 5) { Text("Slow").frame(width: 32, alignment: .leading); Slider(value: binding(\.pointerSpeed), in: 1...11, step: 1).frame(width: 132); Text("Fast").frame(width: 27, alignment: .trailing) }
-                        Toggle("Enhance pointer precision", isOn: binding(\.enhancePrecision))
-                    }
-                    Spacer(minLength: 0)
-                }.padding(7)
-            }.frame(maxWidth: .infinity)
-
-            GroupBox("Snap To") {
-                HStack(alignment: .center, spacing: 14) {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 38, height: 40)
-                    Toggle("Automatically move pointer to the default button in a\ndialog box", isOn: binding(\.snapToDefaultButton))
-                    Spacer(minLength: 0)
-                }.padding(7)
-            }.frame(maxWidth: .infinity)
-
-            GroupBox("Visibility") {
-                VStack(alignment: .leading, spacing: 11) {
-                    HStack(alignment: .top, spacing: 14) {
-                        Image(systemName: "cursorarrow.motionlines").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 38, height: 50)
-                        VStack(alignment: .leading, spacing: 8) {
-                            Toggle("Display pointer trails", isOn: binding(\.displayTrails))
-                            HStack(spacing: 5) { Text("Short").frame(width: 32, alignment: .leading); Slider(value: binding(\.trailLength), in: 1...20, step: 1).frame(width: 132).disabled(!store.draft.displayTrails); Text("Long").frame(width: 27, alignment: .trailing) }
+        VStack(spacing: 0) {
+            WindowsTitleBar()
+            WindowsTabBar()
+            VStack(spacing: 8) {
+                WindowsSection("Motion") {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "cursorarrow.motionlines").font(.system(size: 24)).foregroundStyle(.secondary).frame(width: 42, height: 59)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Select a pointer speed:")
+                            speedSlider(label: "Slow", value: binding(\.pointerSpeed), range: 1...11, trailing: "Fast")
+                            Toggle("Enhance pointer precision", isOn: binding(\.enhancePrecision))
                         }
-                        Spacer(minLength: 0)
                     }
-                    Divider()
-                    HStack(spacing: 14) { Image(systemName: "keyboard").font(.system(size: 20)).foregroundStyle(.secondary).frame(width: 38); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)); Spacer(minLength: 0) }
-                    Divider()
-                    HStack(spacing: 14) { Image(systemName: "scope").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 38); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)); Spacer(minLength: 0) }
-                }.padding(7)
-            }.frame(maxWidth: .infinity)
+                }
+
+                WindowsSection("Snap To") {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left").font(.system(size: 22)).foregroundStyle(.secondary).frame(width: 42, height: 42)
+                        Toggle("Automatically move pointer to the default button in a\ndialog box", isOn: binding(\.snapToDefaultButton))
+                    }
+                }
+
+                WindowsSection("Visibility") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(alignment: .top, spacing: 10) {
+                            PointerTrailIcon().frame(width: 42, height: 48)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Toggle("Display pointer trails", isOn: binding(\.displayTrails))
+                                speedSlider(label: "Short", value: binding(\.trailLength), range: 1...20, trailing: "Long")
+                                    .disabled(!store.draft.displayTrails)
+                            }
+                        }
+                        HStack(spacing: 10) { Image(systemName: "keyboard").font(.system(size: 19)).foregroundStyle(.secondary).frame(width: 42); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)) }
+                        HStack(spacing: 10) { Image(systemName: "scope").font(.system(size: 22)).foregroundStyle(.secondary).frame(width: 42); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)) }
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
 
             Spacer(minLength: 0)
             Divider().opacity(0.45)
             MadeWithLoveFooter()
-            HStack { Spacer(); Button("Reset") { store.reset() }.frame(width: 72); Button("Cancel") { store.cancel(); close() }.frame(width: 72); Button("Apply") { store.apply() }.frame(width: 72).keyboardShortcut(.defaultAction) }
+            HStack { Spacer(); Button("Reset") { store.reset() }.frame(width: 68); Button("Cancel") { store.cancel(); close() }.frame(width: 68); Button("Apply") { store.apply() }.frame(width: 68).keyboardShortcut(.defaultAction) }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 9)
         }
-        .padding(10)
+        .font(.system(size: 12))
         .frame(width: 400, height: 455)
+    }
+
+    private func speedSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>, trailing: String) -> some View {
+        HStack(spacing: 5) {
+            Text(label).frame(width: 31, alignment: .leading)
+            Slider(value: value, in: range, step: 1).frame(width: 132)
+            Text(trailing).frame(width: 27, alignment: .trailing)
+        }
+    }
+}
+
+private struct WindowsTitleBar: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "computermouse.fill").font(.system(size: 14)).foregroundStyle(.secondary)
+            Text("Mouse Properties").font(.system(size: 13, weight: .medium))
+            Spacer()
+        }
+        .padding(.leading, 44)
+        .padding(.trailing, 12)
+        .frame(height: 31)
+        .background(.bar)
+    }
+}
+
+private struct WindowsTabBar: View {
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("Pointer Options").font(.system(size: 12)).padding(.horizontal, 9).frame(height: 25)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .overlay(Rectangle().stroke(Color.secondary.opacity(0.35), lineWidth: 0.5))
+            Spacer()
+        }
+        .padding(.leading, 9)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 0.5) }
+    }
+}
+
+private struct WindowsSection<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) { self.title = title; self.content = content() }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Rectangle().stroke(Color.secondary.opacity(0.35), lineWidth: 0.6)
+            content.padding(.horizontal, 9).padding(.top, 13).padding(.bottom, 8)
+            Text(title).padding(.horizontal, 3).font(.system(size: 12)).background(Color(nsColor: .windowBackgroundColor)).offset(x: 7, y: -8)
+        }
+        .padding(.top, 5)
+    }
+}
+
+private struct PointerTrailIcon: View {
+    var body: some View {
+        ZStack {
+            Image(systemName: "cursorarrow").offset(x: -9, y: 4).opacity(0.20)
+            Image(systemName: "cursorarrow").offset(x: -5, y: 2).opacity(0.38)
+            Image(systemName: "cursorarrow").offset(x: -1, y: 0).opacity(0.60)
+            Image(systemName: "cursorarrow").offset(x: 3, y: -2)
+        }
+        .font(.system(size: 19))
+        .foregroundStyle(.secondary)
     }
 }
 
