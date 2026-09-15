@@ -126,8 +126,8 @@ final class TrailOverlayView: NSView {
         pointer.contents = image
         pointer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
         pointer.frame = CGRect(x: point.x - 1, y: point.y - size.height + 1, width: size.width, height: size.height)
-        // Windows keeps every ghost at a constant translucency, then removes it at once.
-        pointer.opacity = 0.46
+        // Windows trail ghosts are full-strength cursor images, removed together on delay.
+        pointer.opacity = 1
         layer?.addSublayer(pointer)
         DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { pointer.removeFromSuperlayer() }
     }
@@ -179,7 +179,8 @@ final class MouseTrailController {
     private var eventTapSource: CFRunLoopSource?
     nonisolated(unsafe) private var baseSensitivity: CGFloat = 1
     nonisolated(unsafe) private var remappedPointerPosition: CGPoint?
-    private let sampleInterval: TimeInterval = 1.0 / 60.0
+    // Windows uses widely spaced cursor stamps rather than sampling every display frame.
+    private let sampleInterval: TimeInterval = 1.0 / 30.0
     var isRunning = false
 
     init(settings: SettingsStore) {
@@ -194,7 +195,7 @@ final class MouseTrailController {
         rebuildOverlays()
         overlays.forEach { $0.orderFrontRegardless() }
         installEventTap()
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .keyDown]
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .flagsChanged, .keyDown]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
             let location = event.window?.convertPoint(toScreen: event.locationInWindow) ?? event.locationInWindow
             Task { @MainActor in self?.handle(event, location: location) }
@@ -229,7 +230,10 @@ final class MouseTrailController {
     }
 
     private func handle(_ event: NSEvent, location: CGPoint) {
-        if event.type == .keyDown && settings.active.hidePointerWhileTyping {
+        if event.type == .flagsChanged {
+            // Fallback for Macs where a session event tap is not authorized yet.
+            controlChanged(event.modifierFlags.contains(.control))
+        } else if event.type == .keyDown && settings.active.hidePointerWhileTyping {
             NSCursor.setHiddenUntilMouseMoves(true)
         } else {
             recordPointerLocation()
