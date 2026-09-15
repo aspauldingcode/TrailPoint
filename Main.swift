@@ -321,10 +321,10 @@ final class SettingsPanelController {
     private let panel: NSPanel
 
     init(store: SettingsStore) {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow, .fullSizeContentView], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "Mouse Properties"
-        panel.titleVisibility = .hidden
-        panel.titlebarAppearsTransparent = true
+        panel.titleVisibility = .visible
+        panel.titlebarAppearsTransparent = false
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.isFloatingPanel = true
@@ -347,7 +347,6 @@ struct PointerOptionsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            WindowsTitleBar()
             WindowsTabBar()
             VStack(spacing: 8) {
                 WindowsSection("Motion") {
@@ -403,20 +402,6 @@ struct PointerOptionsView: View {
             Slider(value: value, in: range, step: 1).frame(width: 132)
             Text(trailing).frame(width: 27, alignment: .trailing)
         }
-    }
-}
-
-private struct WindowsTitleBar: View {
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "computermouse.fill").font(.system(size: 14)).foregroundStyle(.secondary)
-            Text("Mouse Properties").font(.system(size: 13, weight: .medium))
-            Spacer()
-        }
-        .padding(.leading, 44)
-        .padding(.trailing, 12)
-        .frame(height: 31)
-        .background(.bar)
     }
 }
 
