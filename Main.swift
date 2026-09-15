@@ -167,9 +167,9 @@ final class TrailOverlayView: NSView {
             ring.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
             ring.position = point
             ring.path = CGPath(ellipseIn: ring.bounds, transform: nil)
-            ring.fillColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+            ring.fillColor = NSColor.clear.cgColor
             ring.strokeColor = NSColor.white.cgColor
-            ring.lineWidth = 2
+            ring.lineWidth = 3
             layer?.addSublayer(ring)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { ring.removeFromSuperlayer() }
     }
@@ -301,18 +301,35 @@ final class SettingsPanelController {
     init(store: SettingsStore) {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "Mouse Properties"
-        panel.titleVisibility = .visible
+        panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = false
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
+        installLeftTitleAccessory()
         panel.collectionBehavior = [.moveToActiveSpace]
         panel.contentView = NSHostingView(rootView: PointerOptionsView(store: store, close: { [weak panel] in panel?.close() }))
     }
 
     func show() { panel.center(); panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+
+    private func installLeftTitleAccessory() {
+        let icon = NSImageView(image: NSImage(systemSymbolName: "computermouse.fill", accessibilityDescription: nil)!)
+        icon.contentTintColor = .secondaryLabelColor
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        let title = NSTextField(labelWithString: "Mouse Properties")
+        title.font = .systemFont(ofSize: 13, weight: .medium)
+        let stack = NSStackView(views: [icon, title])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
+        let controller = NSTitlebarAccessoryViewController()
+        controller.view = stack
+        controller.layoutAttribute = .left
+        panel.addTitlebarAccessoryViewController(controller)
+    }
 }
 
 struct PointerOptionsView: View {
@@ -340,7 +357,7 @@ struct PointerOptionsView: View {
 
                 WindowsSection("Snap To") {
                     HStack(spacing: 10) {
-                        Image(systemName: "arrow.down.right.and.arrow.up.left").font(.system(size: 22)).foregroundStyle(.secondary).frame(width: 42, height: 42)
+                        SnapToIcon().frame(width: 42, height: 42)
                         Toggle("Automatically move pointer to the default button in a\ndialog box", isOn: binding(\.snapToDefaultButton))
                     }
                 }
@@ -355,8 +372,8 @@ struct PointerOptionsView: View {
                                     .disabled(!store.draft.displayTrails)
                             }
                         }
-                        HStack(spacing: 10) { Image(systemName: "keyboard").font(.system(size: 19)).foregroundStyle(.secondary).frame(width: 42); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)) }
-                        HStack(spacing: 10) { Image(systemName: "scope").font(.system(size: 22)).foregroundStyle(.secondary).frame(width: 42); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)) }
+                        HStack(spacing: 10) { TypingHideIcon().frame(width: 42, height: 32); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)) }
+                        HStack(spacing: 10) { PointerLocationIcon().frame(width: 42, height: 36); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)) }
                     }
                 }
             }
@@ -423,6 +440,39 @@ private struct PointerTrailIcon: View {
         }
         .font(.system(size: 19))
         .foregroundStyle(.secondary)
+    }
+}
+
+private struct SnapToIcon: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 1.5).fill(Color(nsColor: .controlBackgroundColor)).overlay(RoundedRectangle(cornerRadius: 1.5).stroke(.secondary.opacity(0.65), lineWidth: 1)).frame(width: 24, height: 19).offset(x: -4, y: -3)
+            Image(systemName: "cursorarrow").font(.system(size: 17)).foregroundStyle(.secondary).offset(x: 8, y: 8)
+        }
+    }
+}
+
+private struct TypingHideIcon: View {
+    var body: some View {
+        ZStack {
+            Rectangle().stroke(.secondary.opacity(0.7), lineWidth: 1).frame(width: 23, height: 17).offset(x: -4, y: -4)
+            Rectangle().fill(.secondary.opacity(0.28)).frame(width: 13, height: 1).offset(x: -4, y: -7)
+            ForEach(0 ..< 4, id: \.self) { index in
+                Circle().fill(.secondary.opacity(0.68)).frame(width: 2.2, height: 2.2).offset(x: 4 + CGFloat(index) * 3.1, y: 4 + CGFloat(index) * 3.1)
+            }
+            Image(systemName: "cursorarrow").font(.system(size: 14)).foregroundStyle(.secondary).offset(x: 7, y: 7)
+        }
+    }
+}
+
+private struct PointerLocationIcon: View {
+    var body: some View {
+        ZStack {
+            Circle().stroke(.secondary.opacity(0.65), lineWidth: 1.4).frame(width: 30, height: 30)
+            Circle().stroke(.secondary.opacity(0.65), lineWidth: 1.4).frame(width: 23, height: 23)
+            Circle().stroke(.secondary.opacity(0.65), lineWidth: 1.4).frame(width: 16, height: 16)
+            Image(systemName: "cursorarrow").font(.system(size: 15)).foregroundStyle(.secondary).offset(x: 3, y: 3)
+        }
     }
 }
 
