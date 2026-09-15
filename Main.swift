@@ -21,7 +21,8 @@ final class SingleInstanceLock {
 }
 
 struct TrailSettings: Codable, Equatable {
-    var pointerSpeed = 5.0
+    // Windows' neutral setting is 6/11: a 1:1 base movement multiplier.
+    var pointerSpeed = 6.0
     var enhancePrecision = true
     var snapToDefaultButton = false
     var displayTrails = true
@@ -34,6 +35,7 @@ struct TrailSettings: Codable, Equatable {
 final class SettingsStore: ObservableObject {
     @Published var draft: TrailSettings
     @Published private(set) var active: TrailSettings
+    var onApply: ((TrailSettings) -> Void)?
     private let key = "TrailPoint.settings"
 
     init() {
@@ -49,6 +51,7 @@ final class SettingsStore: ObservableObject {
         active = draft
         if let data = try? JSONEncoder().encode(active) { UserDefaults.standard.set(data, forKey: key) }
         applyMacMouseSettings(active)
+        onApply?(active)
     }
 
     func cancel() { draft = active }
@@ -57,7 +60,7 @@ final class SettingsStore: ObservableObject {
     /// `com.apple.mouse.scaling` is the tracking-speed value used by macOS Mouse settings.
     /// Starting with Sonoma, `com.apple.mouse.linear` controls the Advanced pointer-acceleration switch.
     private func applyMacMouseSettings(_ settings: TrailSettings) {
-        let scaling = 0.125 + ((settings.pointerSpeed - 1) / 9) * 2.875
+        let scaling = 0.125 + ((settings.pointerSpeed - 1) / 10) * 2.875
         runDefaults(["write", "NSGlobalDomain", "com.apple.mouse.scaling", "-float", String(format: "%.4f", scaling)])
         // A linear pointer is macOS terminology for acceleration being disabled.
         runDefaults(["write", "NSGlobalDomain", "com.apple.mouse.linear", "-bool", settings.enhancePrecision ? "false" : "true"])
@@ -65,7 +68,7 @@ final class SettingsStore: ObservableObject {
 
     private func loadMacMouseSettings(into settings: inout TrailSettings) {
         if let scaling = readDefaults("com.apple.mouse.scaling"), let value = Double(scaling) {
-            settings.pointerSpeed = min(10, max(1, 1 + ((value - 0.125) / 2.875) * 9))
+            settings.pointerSpeed = min(11, max(1, 1 + ((value - 0.125) / 2.875) * 10))
         }
         if let linear = readDefaults("com.apple.mouse.linear")?.lowercased() {
             settings.enhancePrecision = !(linear == "1" || linear == "true" || linear == "yes")
@@ -172,17 +175,26 @@ final class MouseTrailController {
     private var lastPoint: CGPoint?
     private var lastDrawTime = Date.distantPast
     private var controlWasPressed = false
+    private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
+    nonisolated(unsafe) private var baseSensitivity: CGFloat = 1
+    nonisolated(unsafe) private var remappedPointerPosition: CGPoint?
     private let sampleInterval: TimeInterval = 1.0 / 60.0
     var isRunning = false
 
-    init(settings: SettingsStore) { self.settings = settings }
+    init(settings: SettingsStore) {
+        self.settings = settings
+        updateSensitivity(settings.active)
+        settings.onApply = { [weak self] value in self?.updateSensitivity(value) }
+    }
 
     func start() {
         guard !isRunning else { return }
         isRunning = true
         rebuildOverlays()
         overlays.forEach { $0.orderFrontRegardless() }
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .flagsChanged, .keyDown]
+        installEventTap()
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .keyDown]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
             let location = event.window?.convertPoint(toScreen: event.locationInWindow) ?? event.locationInWindow
             Task { @MainActor in self?.handle(event, location: location) }
@@ -200,6 +212,9 @@ final class MouseTrailController {
         isRunning = false
         monitors.forEach { NSEvent.removeMonitor($0) }
         monitors.removeAll()
+        if let eventTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes) }
+        eventTap = nil
+        eventTapSource = nil
         overlays.forEach { $0.orderOut(nil) }
         overlays.removeAll()
         NotificationCenter.default.removeObserver(self)
@@ -214,15 +229,68 @@ final class MouseTrailController {
     }
 
     private func handle(_ event: NSEvent, location: CGPoint) {
-        if event.type == .flagsChanged {
-            let controlIsPressed = event.modifierFlags.contains(.control)
-            if controlIsPressed && !controlWasPressed && settings.active.showLocationWithControl { showLocator(at: location) }
-            controlWasPressed = controlIsPressed
-        } else if event.type == .keyDown && settings.active.hidePointerWhileTyping {
+        if event.type == .keyDown && settings.active.hidePointerWhileTyping {
             NSCursor.setHiddenUntilMouseMoves(true)
         } else {
             recordPointerLocation()
         }
+    }
+
+    private func updateSensitivity(_ value: TrailSettings) {
+        let speed = value.pointerSpeed
+        // Windows' 6/11 setting is neutral (1:1); the endpoints are 0.25× and 2.25×.
+        baseSensitivity = speed <= 6
+            ? 0.25 + (speed - 1) * 0.15
+            : 1 + (speed - 6) * 0.25
+        remappedPointerPosition = nil
+    }
+
+    private func installEventTap() {
+        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
+            | (1 << CGEventType.mouseMoved.rawValue)
+            | (1 << CGEventType.leftMouseDragged.rawValue)
+            | (1 << CGEventType.rightMouseDragged.rawValue)
+            | (1 << CGEventType.otherMouseDragged.rawValue)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask, callback: { proxy, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<MouseTrailController>.fromOpaque(userInfo).takeUnretainedValue()
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                Task { @MainActor in
+                    if let tap = controller.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+                }
+            } else if type == .flagsChanged {
+                let controlIsPressed = event.flags.contains(.maskControl)
+                Task { @MainActor in controller.controlChanged(controlIsPressed) }
+            } else {
+                controller.applyBaseSensitivity(to: event)
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: context)
+        guard let eventTap else { return }
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        eventTapSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+    }
+
+    private func controlChanged(_ controlIsPressed: Bool) {
+        if controlIsPressed && !controlWasPressed && settings.active.showLocationWithControl {
+            // Read the AppKit global pointer location on the main run loop; it is not tied to window focus.
+            showLocator(at: NSEvent.mouseLocation)
+        }
+        controlWasPressed = controlIsPressed
+    }
+
+    nonisolated private func applyBaseSensitivity(to event: CGEvent) {
+        let incoming = event.location
+        guard baseSensitivity != 1 else { remappedPointerPosition = incoming; return }
+        let current = remappedPointerPosition ?? incoming
+        let deltaX = CGFloat(event.getDoubleValueField(.mouseEventDeltaX))
+        let deltaY = CGFloat(event.getDoubleValueField(.mouseEventDeltaY))
+        let next = CGPoint(x: current.x + deltaX * baseSensitivity, y: current.y + deltaY * baseSensitivity)
+        remappedPointerPosition = next
+        event.location = next
     }
 
     private func recordPointerLocation() {
@@ -249,7 +317,7 @@ final class SettingsPanelController {
     private let panel: NSPanel
 
     init(store: SettingsStore) {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 550, height: 575), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "TrailPoint — Pointer Options"
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
@@ -272,10 +340,10 @@ struct PointerOptionsView: View {
         VStack(spacing: 10) {
             GroupBox("Motion") {
                 HStack(alignment: .top, spacing: 14) {
-                    Image(systemName: "cursorarrow.motionlines").font(.system(size: 31)).foregroundStyle(.secondary).frame(width: 58, height: 72)
-                    VStack(alignment: .leading, spacing: 7) {
+                    Image(systemName: "cursorarrow.motionlines").font(.system(size: 25)).foregroundStyle(.secondary).frame(width: 38, height: 60)
+                    VStack(alignment: .leading, spacing: 4) {
                         Text("Select a pointer speed:")
-                        HStack(spacing: 8) { Text("Slow").frame(width: 34, alignment: .leading); Slider(value: binding(\.pointerSpeed), in: 1...10, step: 1).frame(width: 210); Text("Fast").frame(width: 30, alignment: .trailing) }
+                        HStack(spacing: 5) { Text("Slow").frame(width: 32, alignment: .leading); Slider(value: binding(\.pointerSpeed), in: 1...11, step: 1).frame(width: 132); Text("Fast").frame(width: 27, alignment: .trailing) }
                         Toggle("Enhance pointer precision", isOn: binding(\.enhancePrecision))
                     }
                     Spacer(minLength: 0)
@@ -284,7 +352,7 @@ struct PointerOptionsView: View {
 
             GroupBox("Snap To") {
                 HStack(alignment: .center, spacing: 14) {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left").font(.system(size: 27)).foregroundStyle(.secondary).frame(width: 58, height: 45)
+                    Image(systemName: "arrow.down.right.and.arrow.up.left").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 38, height: 40)
                     Toggle("Automatically move pointer to the default button in a\ndialog box", isOn: binding(\.snapToDefaultButton))
                     Spacer(minLength: 0)
                 }.padding(7)
@@ -293,27 +361,27 @@ struct PointerOptionsView: View {
             GroupBox("Visibility") {
                 VStack(alignment: .leading, spacing: 11) {
                     HStack(alignment: .top, spacing: 14) {
-                        Image(systemName: "cursorarrow.motionlines").font(.system(size: 27)).foregroundStyle(.secondary).frame(width: 58, height: 57)
+                        Image(systemName: "cursorarrow.motionlines").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 38, height: 50)
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Display pointer trails", isOn: binding(\.displayTrails))
-                            HStack(spacing: 8) { Text("Short").frame(width: 34, alignment: .leading); Slider(value: binding(\.trailLength), in: 1...20, step: 1).frame(width: 210).disabled(!store.draft.displayTrails); Text("Long").frame(width: 30, alignment: .trailing) }
+                            HStack(spacing: 5) { Text("Short").frame(width: 32, alignment: .leading); Slider(value: binding(\.trailLength), in: 1...20, step: 1).frame(width: 132).disabled(!store.draft.displayTrails); Text("Long").frame(width: 27, alignment: .trailing) }
                         }
                         Spacer(minLength: 0)
                     }
                     Divider()
-                    HStack(spacing: 14) { Image(systemName: "keyboard").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 58); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)); Spacer(minLength: 0) }
+                    HStack(spacing: 14) { Image(systemName: "keyboard").font(.system(size: 20)).foregroundStyle(.secondary).frame(width: 38); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)); Spacer(minLength: 0) }
                     Divider()
-                    HStack(spacing: 14) { Image(systemName: "scope").font(.system(size: 27)).foregroundStyle(.secondary).frame(width: 58); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)); Spacer(minLength: 0) }
+                    HStack(spacing: 14) { Image(systemName: "scope").font(.system(size: 23)).foregroundStyle(.secondary).frame(width: 38); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)); Spacer(minLength: 0) }
                 }.padding(7)
             }.frame(maxWidth: .infinity)
 
             Spacer(minLength: 0)
             Divider().opacity(0.45)
             MadeWithLoveFooter()
-            HStack { Spacer(); Button("Reset") { store.reset() }.frame(width: 88); Button("Cancel") { store.cancel(); close() }.frame(width: 88); Button("Apply") { store.apply() }.frame(width: 88).keyboardShortcut(.defaultAction) }
+            HStack { Spacer(); Button("Reset") { store.reset() }.frame(width: 72); Button("Cancel") { store.cancel(); close() }.frame(width: 72); Button("Apply") { store.apply() }.frame(width: 72).keyboardShortcut(.defaultAction) }
         }
-        .padding(14)
-        .frame(width: 550, height: 575)
+        .padding(10)
+        .frame(width: 400, height: 455)
     }
 }
 
