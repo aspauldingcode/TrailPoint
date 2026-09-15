@@ -2,9 +2,10 @@
 set -euo pipefail
 
 swift build -c release
-mkdir -p TrailPoint.app/Contents/MacOS
+mkdir -p TrailPoint.app/Contents/MacOS TrailPoint.app/Contents/Resources
 cp .build/release/TrailPoint TrailPoint.app/Contents/MacOS/TrailPoint
 cp AppInfo.plist TrailPoint.app/Contents/Info.plist
+cp AppIcon.icns TrailPoint.app/Contents/Resources/AppIcon.icns
 trailpoint_signing_identity="$(security find-identity -v -p codesigning | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
 if [[ -n "$trailpoint_signing_identity" ]]; then
   # A Developer ID requirement stays stable across source rebuilds, which lets
