@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- TrailPoint: the same four-pointer motion motif used in Pointer Options. -->
+  <g fill="none" stroke="#FFFFFF" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M256 258v312l76-76 108 148 58-43-108-148h164z" stroke-width="42" opacity=".20"/>
+    <path d="M346 206v342l83-83 118 162 63-47-118-162h180z" stroke-width="42" opacity=".38"/>
+    <path d="M442 154v372l90-90 128 176 68-51-128-176h196z" stroke-width="42" opacity=".60"/>
+    <path d="M548 104v406l98-98 140 192 74-55-140-192h214z" stroke-width="44"/>
+  </g>
+</svg>
