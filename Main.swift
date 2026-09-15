@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 import SwiftUI
 import Darwin
-import IOKit.hidsystem
+import ApplicationServices
 
 /// A cross-launch lock. Launch Services normally prevents duplicates, but this also
 /// protects against direct executable launches and `open -n`.
@@ -37,6 +37,9 @@ final class SettingsStore: ObservableObject {
     @Published var draft: TrailSettings
     @Published private(set) var active: TrailSettings
     var onApply: ((TrailSettings) -> Void)?
+    /// `true` when this was an explicit user toggle, so the controller may ask for
+    /// Accessibility permission rather than prompting merely because the app launched.
+    var onSnapToDefaultButtonChange: ((Bool, Bool) -> Void)?
     private let key = "TrailPoint.settings"
 
     init() {
@@ -53,6 +56,9 @@ final class SettingsStore: ObservableObject {
         if let data = try? JSONEncoder().encode(active) { UserDefaults.standard.set(data, forKey: key) }
         applyMacMouseSettings(active)
         onApply?(active)
+        // Recheck on every Apply while Snap To is checked. This catches a
+        // permission grant made moments earlier and a later revocation alike.
+        onSnapToDefaultButtonChange?(active.snapToDefaultButton, active.snapToDefaultButton)
     }
 
     func applyPointerSpeed() {
@@ -81,7 +87,7 @@ final class SettingsStore: ObservableObject {
         // A linear pointer is macOS terminology for acceleration being disabled.
         runDefaults(["write", "NSGlobalDomain", "com.apple.mouse.linear", "-bool", settings.enhancePrecision ? "false" : "true"])
         // Apply the same tracking value to HID immediately; the defaults value alone can be deferred.
-        IOHIDSetAccelerationWithKey(NXOpenEventStatus(), "HIDMouseAcceleration" as NSString, scaling)
+        applyImmediateMouseTracking(scaling)
     }
 
     private func loadMacMouseSettings(into settings: inout TrailSettings) {
@@ -112,6 +118,22 @@ final class SettingsStore: ObservableObject {
         task.standardOutput = Pipe()
         task.standardError = Pipe()
         do { try task.run(); task.waitUntilExit() } catch { NSSound.beep() }
+    }
+
+    /// `IOHIDSetAccelerationWithKey` has no replacement API, yet remains the
+    /// only system interface that applies mouse tracking speed immediately.
+    /// Resolve it at runtime so the project does not compile against a deprecated
+    /// SDK declaration while retaining that current-session behavior.
+    private func applyImmediateMouseTracking(_ scaling: Double) {
+        typealias OpenEventStatus = @convention(c) () -> UInt32
+        typealias SetAcceleration = @convention(c) (UInt32, CFString, Double) -> Int32
+        guard let library = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY),
+              let openSymbol = dlsym(library, "NXOpenEventStatus"),
+              let setSymbol = dlsym(library, "IOHIDSetAccelerationWithKey") else { return }
+        defer { dlclose(library) }
+        let open = unsafeBitCast(openSymbol, to: OpenEventStatus.self)
+        let set = unsafeBitCast(setSymbol, to: SetAcceleration.self)
+        _ = set(open(), "HIDMouseAcceleration" as CFString, scaling)
     }
 
     private func mouseScaling(for speed: Double) -> Double {
@@ -204,12 +226,18 @@ final class MouseTrailController {
     private var controlWasPressed = false
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
+    private var snapTimer: Timer?
+    private var lastSnappedTarget: String?
+    private var hasShownSnapGrantedAlert = false
     // Windows uses widely spaced cursor stamps rather than sampling every display frame.
     private let sampleInterval: TimeInterval = 1.0 / 30.0
     var isRunning = false
 
     init(settings: SettingsStore) {
         self.settings = settings
+        settings.onSnapToDefaultButtonChange = { [weak self] enabled, userInitiated in
+            self?.configureSnapToDefaultButton(enabled: enabled, requestPermission: userInitiated)
+        }
     }
 
     func start() {
@@ -218,6 +246,7 @@ final class MouseTrailController {
         rebuildOverlays()
         overlays.forEach { $0.orderFrontRegardless() }
         installEventTap()
+        configureSnapToDefaultButton(enabled: settings.active.snapToDefaultButton, requestPermission: false)
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .flagsChanged, .keyDown]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
             let location = event.window?.convertPoint(toScreen: event.locationInWindow) ?? event.locationInWindow
@@ -239,6 +268,9 @@ final class MouseTrailController {
         if let eventTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes) }
         eventTap = nil
         eventTapSource = nil
+        snapTimer?.invalidate()
+        snapTimer = nil
+        lastSnappedTarget = nil
         overlays.forEach { $0.orderOut(nil) }
         overlays.removeAll()
         NotificationCenter.default.removeObserver(self)
@@ -284,6 +316,124 @@ final class MouseTrailController {
         eventTapSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
+    }
+
+    private func configureSnapToDefaultButton(enabled: Bool, requestPermission: Bool) {
+        snapTimer?.invalidate()
+        snapTimer = nil
+        lastSnappedTarget = nil
+        guard enabled else { return }
+
+        if requestPermission { presentSnapToPermissionAlert() }
+
+        // Default buttons appear after a dialog is created, so poll the focused
+        // accessibility window briefly. The target key makes this a one-time snap.
+        snapTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.snapToDefaultButtonIfNeeded() }
+        }
+        snapTimer?.tolerance = 0.04
+    }
+
+    private func presentSnapToPermissionAlert() {
+        if AXIsProcessTrusted() {
+            guard !hasShownSnapGrantedAlert else { return }
+            hasShownSnapGrantedAlert = true
+            let alert = NSAlert()
+            alert.messageText = "Granted"
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Grant TrailPoint Accessibility access"
+        alert.informativeText = "Without it, macOS prevents reading other apps’ dialog controls."
+        alert.addButton(withTitle: "Grant Access")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // This is Apple's supported prompt which sends the person to Privacy &
+        // Security > Accessibility. If permission is later revoked, this branch
+        // is reached again the next time Snap To is enabled.
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func snapToDefaultButtonIfNeeded() {
+        guard settings.active.snapToDefaultButton, AXIsProcessTrusted(),
+              let application = NSWorkspace.shared.frontmostApplication else { return }
+
+        let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        guard let target = defaultButtonTarget(in: appElement) else {
+            lastSnappedTarget = nil
+            return
+        }
+
+        let key = "\(application.processIdentifier):\(windowNumber(target.container) ?? -1):\(Int(target.frame.midX)): \(Int(target.frame.midY))"
+        guard key != lastSnappedTarget else { return }
+        // Accessibility frames and CGWarpMouseCursorPosition both use Quartz's
+        // global display coordinate space (origin at the upper-left).
+        guard CGWarpMouseCursorPosition(CGPoint(x: target.frame.midX, y: target.frame.midY)) == .success else { return }
+        lastSnappedTarget = key
+    }
+
+    /// Sheets often expose their default control from the focused UI element's
+    /// top-level element rather than the application's focused window. Search
+    /// those first, then the app's visible windows as an AppKit fallback.
+    private func defaultButtonTarget(in application: AXUIElement) -> (container: AXUIElement, frame: CGRect)? {
+        var candidates: [AXUIElement] = []
+        if let focusedWindow = accessibilityElement(application, attribute: kAXFocusedWindowAttribute) {
+            candidates.append(focusedWindow)
+        }
+        if let focusedElement = accessibilityElement(application, attribute: "AXFocusedUIElement") {
+            candidates.append(focusedElement)
+            if let topLevel = accessibilityElement(focusedElement, attribute: "AXTopLevelUIElement") {
+                candidates.append(topLevel)
+            }
+            if let window = accessibilityElement(focusedElement, attribute: "AXWindow") {
+                candidates.append(window)
+            }
+        }
+        candidates.append(contentsOf: accessibilityElements(application, attribute: "AXWindows"))
+
+        for candidate in candidates {
+            guard let button = accessibilityElement(candidate, attribute: kAXDefaultButtonAttribute),
+                  let frame = accessibilityFrame(button) else { continue }
+            return (candidate, frame)
+        }
+        return nil
+    }
+
+    private func accessibilityElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value else { return nil }
+        return unsafeDowncast(value, to: AXUIElement.self)
+    }
+
+    private func accessibilityElements(_ element: AXUIElement, attribute: String) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let elements = value as? [AnyObject] else { return [] }
+        return elements.compactMap { item in
+            guard CFGetTypeID(item) == AXUIElementGetTypeID() else { return nil }
+            return unsafeDowncast(item, to: AXUIElement.self)
+        }
+    }
+
+    private func accessibilityFrame(_ element: AXUIElement) -> CGRect? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, "AXFrame" as CFString, &value) == .success,
+              let value else { return nil }
+        let axValue = unsafeDowncast(value, to: AXValue.self)
+        var frame = CGRect.zero
+        return AXValueGetValue(axValue, .cgRect, &frame) ? frame : nil
+    }
+
+    private func windowNumber(_ element: AXUIElement) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, "AXWindowNumber" as CFString, &value) == .success,
+              let value else { return nil }
+        return (value as? NSNumber)?.intValue
     }
 
     private func controlChanged(_ controlIsPressed: Bool) {
@@ -360,10 +510,19 @@ struct PointerOptionsView: View {
 
                 WindowsSection("Snap To") {
                     HStack(spacing: 10) {
-                        SnapToIcon().frame(width: 42, height: 42)
-                        Toggle("Automatically move pointer to the default button in a\ndialog box", isOn: binding(\.snapToDefaultButton))
+                        SnapToIcon().frame(width: 42, height: 32)
+                        Toggle(isOn: binding(\.snapToDefaultButton)) {
+                            Text("Automatically move pointer to the default\nbutton in a dialog box")
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(.leading)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
+                // The 58 px border maps from the 76 px Windows reference box;
+                // include the section's 5 px inter-section gap outside the border.
+                .frame(height: 63)
 
                 WindowsSection("Visibility") {
                     VStack(alignment: .leading, spacing: 12) {
@@ -375,7 +534,7 @@ struct PointerOptionsView: View {
                                     .disabled(!store.draft.displayTrails)
                             }
                         }
-                        HStack(spacing: 10) { TypingHideIcon().frame(width: 42, height: 32); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)).onChange(of: store.draft.hidePointerWhileTyping) { _ in store.applyHidePointerWhileTyping() } }
+                        HStack(spacing: 10) { TypingHideIcon().frame(width: 42, height: 42); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)).onChange(of: store.draft.hidePointerWhileTyping) { _ in store.applyHidePointerWhileTyping() } }
                         HStack(spacing: 10) { PointerLocationIcon().frame(width: 42, height: 36); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)) }
                     }
                 }
@@ -398,7 +557,7 @@ struct PointerOptionsView: View {
         HStack(spacing: 5) {
             Text(label).frame(width: 31, alignment: .leading)
             Slider(value: value, in: range, step: 1).frame(width: 132)
-            Text(trailing).frame(width: 27, alignment: .trailing)
+            Text(trailing).frame(width: 35, alignment: .trailing)
         }
         .onChange(of: value.wrappedValue) { _ in onChange?() }
     }
@@ -458,13 +617,24 @@ private struct SnapToIcon: View {
 
 private struct TypingHideIcon: View {
     var body: some View {
-        ZStack {
-            Rectangle().stroke(.secondary.opacity(0.7), lineWidth: 1).frame(width: 23, height: 17).offset(x: -4, y: -4)
-            Rectangle().fill(.secondary.opacity(0.28)).frame(width: 13, height: 1).offset(x: -4, y: -7)
-            ForEach(0 ..< 4, id: \.self) { index in
-                Circle().fill(.secondary.opacity(0.68)).frame(width: 2.2, height: 2.2).offset(x: 4 + CGFloat(index) * 3.1, y: 4 + CGFloat(index) * 3.1)
-            }
-            Image(systemName: "cursorarrow").font(.system(size: 14)).foregroundStyle(.secondary).offset(x: 7, y: 7)
+        Canvas { context, _ in
+            // The reference is a wide, low dialog—not a tall card.
+            context.stroke(Path(CGRect(x: 2, y: 5, width: 30, height: 19)), with: .color(.secondary.opacity(0.7)), lineWidth: 1.45)
+            // Equal inset on each opposing edge: 6 pt horizontal, 4 pt vertical.
+            context.fill(Path(CGRect(x: 8, y: 9, width: 18, height: 11)), with: .color(.secondary.opacity(0.28)))
+
+            // A 17 pt cursorarrow-shaped silhouette, drawn only as a dotted
+            // outline. Its dimensions and angle match the Snap To cursor.
+            var cursor = Path()
+            cursor.move(to: CGPoint(x: 27, y: 19))
+            cursor.addLine(to: CGPoint(x: 27, y: 35))
+            cursor.addLine(to: CGPoint(x: 30.4, y: 31))
+            cursor.addLine(to: CGPoint(x: 34.7, y: 38))
+            cursor.addLine(to: CGPoint(x: 37.2, y: 36))
+            cursor.addLine(to: CGPoint(x: 33, y: 29))
+            cursor.addLine(to: CGPoint(x: 38.9, y: 29))
+            cursor.closeSubpath()
+            context.stroke(cursor, with: .color(.secondary.opacity(0.78)), style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round, dash: [0.7, 2.2]))
         }
     }
 }
@@ -472,10 +642,21 @@ private struct TypingHideIcon: View {
 private struct PointerLocationIcon: View {
     var body: some View {
         ZStack {
-            Circle().stroke(.secondary.opacity(0.65), lineWidth: 1.4).frame(width: 30, height: 30)
-            Circle().stroke(.secondary.opacity(0.65), lineWidth: 1.4).frame(width: 23, height: 23)
-            Circle().stroke(.secondary.opacity(0.65), lineWidth: 1.4).frame(width: 16, height: 16)
-            Image(systemName: "cursorarrow").font(.system(size: 15)).foregroundStyle(.secondary).offset(x: 3, y: 3)
+            Canvas { context, _ in
+            // In the Windows artwork all three circles meet at the arrow's hot
+            // spot. Keeping one explicit point avoids the SF Symbol's inset tip.
+            let tip = CGPoint(x: 20, y: 18)
+            for diameter in [25.0, 19.0, 13.0] {
+                let rect = CGRect(x: tip.x - diameter / 2, y: tip.y - diameter / 2, width: diameter, height: diameter)
+                context.stroke(Path(ellipseIn: rect), with: .color(.secondary.opacity(0.64)), lineWidth: 1.35)
+            }
+            }
+            Image(systemName: "cursorarrow")
+                .font(.system(size: 18))
+                .foregroundStyle(.secondary.opacity(0.78))
+                // At 18 pt the Symbol has a 15×21 layout box and its visible
+                // tip is inset by 2×3 pt. This puts that tip at (20, 18).
+                .offset(x: 4.5, y: 7.5)
         }
     }
 }
@@ -527,12 +708,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "TrailPoint")
         let menu = NSMenu()
-        toggleItem = menu.addItem(withTitle: "Stop Trail", action: #selector(toggleTrail), keyEquivalent: "")
+        toggleItem = menu.addItem(withTitle: "Pause TrailPoint", action: #selector(toggleTrail), keyEquivalent: "")
         toggleItem.target = self
-        let options = menu.addItem(withTitle: "Pointer Options…", action: #selector(showOptions), keyEquivalent: ",")
+        let options = menu.addItem(withTitle: "Pointer Options…", action: #selector(showOptions), keyEquivalent: "")
         options.target = self
         menu.addItem(.separator())
-        let quit = menu.addItem(withTitle: "Quit TrailPoint", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = menu.addItem(withTitle: "Quit TrailPoint", action: #selector(quitApp), keyEquivalent: "")
         quit.target = self
         statusItem.menu = menu
         trail.start()
@@ -540,7 +721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) { trail.stop() }
-    @objc private func toggleTrail() { if trail.isRunning { trail.stop(); toggleItem.title = "Start Trail" } else { trail.start(); toggleItem.title = "Stop Trail" } }
+    @objc private func toggleTrail() { if trail.isRunning { trail.stop(); toggleItem.title = "Start TrailPoint" } else { trail.start(); toggleItem.title = "Pause TrailPoint" } }
     @objc private func showOptions() { preferences.show() }
     @objc private func activateExistingInstance(_ notification: Notification) { showOptions() }
     @objc private func quitApp() { NSApp.terminate(nil) }

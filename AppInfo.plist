@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>TrailPoint</string>
     <key>CFBundleIdentifier</key>
-    <string>com.trailpoint.app</string>
+	<string>com.aspauldingcode.trailpoint</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -18,9 +18,11 @@
     <string>1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSHighResolutionCapable</key>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>TrailPoint uses Accessibility to find a dialog’s default button and move the pointer to it.</string>
+	<key>NSHighResolutionCapable</key>
     <true/>
 </dict>
 </plist>
