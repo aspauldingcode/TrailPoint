@@ -61,6 +61,15 @@ final class SettingsStore: ObservableObject {
         applyMacMouseSettings(active)
     }
 
+    func applyHidePointerWhileTyping() {
+        active.hidePointerWhileTyping = draft.hidePointerWhileTyping
+        if let data = try? JSONEncoder().encode(active) { UserDefaults.standard.set(data, forKey: key) }
+        if !active.hidePointerWhileTyping {
+            NSCursor.setHiddenUntilMouseMoves(false)
+            NSCursor.unhide()
+        }
+    }
+
     func cancel() { draft = active }
     func reset() { draft = TrailSettings() }
 
@@ -174,12 +183,12 @@ final class TrailOverlayView: NSView {
             ring.position = point
             let path = CGMutablePath()
             path.addEllipse(in: ring.bounds)
-            path.addEllipse(in: ring.bounds.insetBy(dx: 5, dy: 5))
+            path.addEllipse(in: ring.bounds.insetBy(dx: 3.5, dy: 3.5))
             ring.path = path
             ring.fillRule = .evenOdd
             ring.fillColor = NSColor.windowBackgroundColor.cgColor
             ring.strokeColor = NSColor.white.cgColor
-            ring.lineWidth = 1.4
+            ring.lineWidth = 0.8
             layer?.addSublayer(ring)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { ring.removeFromSuperlayer() }
     }
@@ -366,7 +375,7 @@ struct PointerOptionsView: View {
                                     .disabled(!store.draft.displayTrails)
                             }
                         }
-                        HStack(spacing: 10) { TypingHideIcon().frame(width: 42, height: 32); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)) }
+                        HStack(spacing: 10) { TypingHideIcon().frame(width: 42, height: 32); Toggle("Hide pointer while typing", isOn: binding(\.hidePointerWhileTyping)).onChange(of: store.draft.hidePointerWhileTyping) { _ in store.applyHidePointerWhileTyping() } }
                         HStack(spacing: 10) { PointerLocationIcon().frame(width: 42, height: 36); Toggle("Show location of pointer when I press the Control key", isOn: binding(\.showLocationWithControl)) }
                     }
                 }
