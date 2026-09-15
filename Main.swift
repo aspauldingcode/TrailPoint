@@ -2,6 +2,7 @@ import AppKit
 import QuartzCore
 import SwiftUI
 import Darwin
+import IOKit.hidsystem
 
 /// A cross-launch lock. Launch Services normally prevents duplicates, but this also
 /// protects against direct executable launches and `open -n`.
@@ -60,15 +61,17 @@ final class SettingsStore: ObservableObject {
     /// `com.apple.mouse.scaling` is the tracking-speed value used by macOS Mouse settings.
     /// Starting with Sonoma, `com.apple.mouse.linear` controls the Advanced pointer-acceleration switch.
     private func applyMacMouseSettings(_ settings: TrailSettings) {
-        let scaling = 0.125 + ((settings.pointerSpeed - 1) / 10) * 2.875
+        let scaling = mouseScaling(for: settings.pointerSpeed)
         runDefaults(["write", "NSGlobalDomain", "com.apple.mouse.scaling", "-float", String(format: "%.4f", scaling)])
         // A linear pointer is macOS terminology for acceleration being disabled.
         runDefaults(["write", "NSGlobalDomain", "com.apple.mouse.linear", "-bool", settings.enhancePrecision ? "false" : "true"])
+        // Apply the same tracking value to HID immediately; the defaults value alone can be deferred.
+        IOHIDSetAccelerationWithKey(NXOpenEventStatus(), "HIDMouseAcceleration" as NSString, scaling)
     }
 
     private func loadMacMouseSettings(into settings: inout TrailSettings) {
         if let scaling = readDefaults("com.apple.mouse.scaling"), let value = Double(scaling) {
-            settings.pointerSpeed = min(11, max(1, 1 + ((value - 0.125) / 2.875) * 10))
+            settings.pointerSpeed = nearestSpeed(for: value)
         }
         if let linear = readDefaults("com.apple.mouse.linear")?.lowercased() {
             settings.enhancePrecision = !(linear == "1" || linear == "true" || linear == "yes")
@@ -95,6 +98,17 @@ final class SettingsStore: ObservableObject {
         task.standardError = Pipe()
         do { try task.run(); task.waitUntilExit() } catch { NSSound.beep() }
     }
+
+    private func mouseScaling(for speed: Double) -> Double {
+        let values: [Double] = [0, 0.125, 0.5, 0.6875, 0.875, 1, 1.5, 2, 2.5, 3, 3.5]
+        return values[min(values.count - 1, max(0, Int(speed.rounded()) - 1))]
+    }
+
+    private func nearestSpeed(for scaling: Double) -> Double {
+        let values: [Double] = [0, 0.125, 0.5, 0.6875, 0.875, 1, 1.5, 2, 2.5, 3, 3.5]
+        let index = values.indices.min(by: { abs(values[$0] - scaling) < abs(values[$1] - scaling) }) ?? 5
+        return Double(index + 1)
+    }
 }
 
 final class TrailOverlayWindow: NSWindow {
@@ -120,12 +134,19 @@ final class TrailOverlayView: NSView {
     override func updateLayer() { layer?.backgroundColor = NSColor.clear.cgColor }
 
     func addPointer(at point: CGPoint, lifetime: CFTimeInterval) {
-        let image = NSCursor.arrow.image
+        let cursor = NSCursor.arrow
+        let image = cursor.image
         let size = image.size
+        let hotSpot = cursor.hotSpot
         let pointer = CALayer()
         pointer.contents = image
         pointer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        pointer.frame = CGRect(x: point.x - 1, y: point.y - size.height + 1, width: size.width, height: size.height)
+        pointer.frame = CGRect(
+            x: point.x - hotSpot.x,
+            y: point.y - (size.height - hotSpot.y),
+            width: size.width,
+            height: size.height
+        )
         // Windows trail ghosts are full-strength cursor images, removed together on delay.
         pointer.opacity = 1
         layer?.addSublayer(pointer)
@@ -133,37 +154,24 @@ final class TrailOverlayView: NSView {
     }
 
     func showLocator(at point: CGPoint) {
-        for index in 0 ..< 3 {
+        let diameters: [CGFloat] = [108, 88, 68, 48, 28]
+        for (index, diameter) in diameters.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.095) { [weak self] in
+                self?.showLocatorRing(at: point, diameter: diameter)
+            }
+        }
+    }
+
+    private func showLocatorRing(at point: CGPoint, diameter: CGFloat) {
             let ring = CAShapeLayer()
-            let diameter: CGFloat = 30 + CGFloat(index) * 25
-            // A self-contained layer makes the contraction pivot exactly at the captured cursor point.
             ring.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
             ring.position = point
             ring.path = CGPath(ellipseIn: ring.bounds, transform: nil)
-            ring.fillColor = NSColor.clear.cgColor
-            ring.strokeColor = NSColor.controlAccentColor.cgColor
-            ring.lineWidth = 2.5
-            ring.shadowColor = NSColor.black.cgColor
-            ring.shadowOpacity = 0.28
-            ring.shadowRadius = 2
+            ring.fillColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+            ring.strokeColor = NSColor.white.cgColor
+            ring.lineWidth = 2
             layer?.addSublayer(ring)
-
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = 0.95
-            fade.toValue = 0
-            let contract = CABasicAnimation(keyPath: "transform.scale")
-            contract.fromValue = 2.1
-            contract.toValue = 0.08
-            let group = CAAnimationGroup()
-            group.animations = [fade, contract]
-            group.duration = 0.46
-            group.beginTime = CACurrentMediaTime() + Double(index) * 0.10
-            group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            CATransaction.begin()
-            CATransaction.setCompletionBlock { ring.removeFromSuperlayer() }
-            ring.add(group, forKey: "controlLocator")
-            CATransaction.commit()
-        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { ring.removeFromSuperlayer() }
     }
 }
 
@@ -177,16 +185,12 @@ final class MouseTrailController {
     private var controlWasPressed = false
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
-    nonisolated(unsafe) private var baseSensitivity: CGFloat = 1
-    nonisolated(unsafe) private var remappedPointerPosition: CGPoint?
     // Windows uses widely spaced cursor stamps rather than sampling every display frame.
     private let sampleInterval: TimeInterval = 1.0 / 30.0
     var isRunning = false
 
     init(settings: SettingsStore) {
         self.settings = settings
-        updateSensitivity(settings.active)
-        settings.onApply = { [weak self] value in self?.updateSensitivity(value) }
     }
 
     func start() {
@@ -240,21 +244,8 @@ final class MouseTrailController {
         }
     }
 
-    private func updateSensitivity(_ value: TrailSettings) {
-        let speed = value.pointerSpeed
-        // Windows' 6/11 setting is neutral (1:1); the endpoints are 0.25× and 2.25×.
-        baseSensitivity = speed <= 6
-            ? 0.25 + (speed - 1) * 0.15
-            : 1 + (speed - 6) * 0.25
-        remappedPointerPosition = nil
-    }
-
     private func installEventTap() {
         let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
-            | (1 << CGEventType.mouseMoved.rawValue)
-            | (1 << CGEventType.leftMouseDragged.rawValue)
-            | (1 << CGEventType.rightMouseDragged.rawValue)
-            | (1 << CGEventType.otherMouseDragged.rawValue)
         let context = Unmanaged.passUnretained(self).toOpaque()
         eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask, callback: { proxy, type, event, userInfo in
             guard let userInfo else { return Unmanaged.passUnretained(event) }
@@ -266,8 +257,6 @@ final class MouseTrailController {
             } else if type == .flagsChanged {
                 let controlIsPressed = event.flags.contains(.maskControl)
                 Task { @MainActor in controller.controlChanged(controlIsPressed) }
-            } else {
-                controller.applyBaseSensitivity(to: event)
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: context)
@@ -284,17 +273,6 @@ final class MouseTrailController {
             showLocator(at: NSEvent.mouseLocation)
         }
         controlWasPressed = controlIsPressed
-    }
-
-    nonisolated private func applyBaseSensitivity(to event: CGEvent) {
-        let incoming = event.location
-        guard baseSensitivity != 1 else { remappedPointerPosition = incoming; return }
-        let current = remappedPointerPosition ?? incoming
-        let deltaX = CGFloat(event.getDoubleValueField(.mouseEventDeltaX))
-        let deltaY = CGFloat(event.getDoubleValueField(.mouseEventDeltaY))
-        let next = CGPoint(x: current.x + deltaX * baseSensitivity, y: current.y + deltaY * baseSensitivity)
-        remappedPointerPosition = next
-        event.location = next
     }
 
     private func recordPointerLocation() {
