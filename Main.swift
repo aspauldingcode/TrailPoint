@@ -55,6 +55,12 @@ final class SettingsStore: ObservableObject {
         onApply?(active)
     }
 
+    func applyPointerSpeed() {
+        active.pointerSpeed = draft.pointerSpeed
+        if let data = try? JSONEncoder().encode(active) { UserDefaults.standard.set(data, forKey: key) }
+        applyMacMouseSettings(active)
+    }
+
     func cancel() { draft = active }
     func reset() { draft = TrailSettings() }
 
@@ -304,36 +310,20 @@ final class SettingsPanelController {
 
     init(store: SettingsStore) {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 455), styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
-        panel.title = "Mouse Properties"
-        panel.titleVisibility = .hidden
+        panel.title = "🖱 Mouse Properties"
+        panel.titleVisibility = .visible
         panel.titlebarAppearsTransparent = false
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
-        installLeftTitleAccessory()
         panel.collectionBehavior = [.moveToActiveSpace]
         panel.contentView = NSHostingView(rootView: PointerOptionsView(store: store, close: { [weak panel] in panel?.close() }))
     }
 
     func show() { panel.center(); panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
 
-    private func installLeftTitleAccessory() {
-        let icon = NSImageView(image: NSImage(systemSymbolName: "computermouse.fill", accessibilityDescription: nil)!)
-        icon.contentTintColor = .secondaryLabelColor
-        icon.setContentHuggingPriority(.required, for: .horizontal)
-        let title = NSTextField(labelWithString: "Mouse Properties")
-        title.font = .systemFont(ofSize: 13, weight: .medium)
-        let stack = NSStackView(views: [icon, title])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 6
-        let controller = NSTitlebarAccessoryViewController()
-        controller.view = stack
-        controller.layoutAttribute = .left
-        panel.addTitlebarAccessoryViewController(controller)
-    }
 }
 
 struct PointerOptionsView: View {
@@ -353,7 +343,7 @@ struct PointerOptionsView: View {
                         Image(systemName: "cursorarrow.motionlines").font(.system(size: 24)).foregroundStyle(.secondary).frame(width: 42, height: 59)
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Select a pointer speed:")
-                            speedSlider(label: "Slow", value: binding(\.pointerSpeed), range: 1...11, trailing: "Fast")
+                            speedSlider(label: "Slow", value: binding(\.pointerSpeed), range: 1...11, trailing: "Fast", onChange: store.applyPointerSpeed)
                             Toggle("Enhance pointer precision", isOn: binding(\.enhancePrecision))
                         }
                     }
@@ -395,12 +385,13 @@ struct PointerOptionsView: View {
         .frame(width: 400, height: 455)
     }
 
-    private func speedSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>, trailing: String) -> some View {
+    private func speedSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>, trailing: String, onChange: (() -> Void)? = nil) -> some View {
         HStack(spacing: 5) {
             Text(label).frame(width: 31, alignment: .leading)
             Slider(value: value, in: range, step: 1).frame(width: 132)
             Text(trailing).frame(width: 27, alignment: .trailing)
         }
+        .onChange(of: value.wrappedValue) { _ in onChange?() }
     }
 }
 
