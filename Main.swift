@@ -722,7 +722,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let options = menu.addItem(withTitle: "Pointer Options…", action: #selector(showOptions), keyEquivalent: "")
         options.target = self
         menu.addItem(.separator())
-        let quit = menu.addItem(withTitle: "Quit TrailPoint", action: #selector(quitApp), keyEquivalent: "")
+        let versionStr = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"
+        let versionItem = menu.addItem(withTitle: "TrailPoint v\(versionStr)", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        let quit = menu.addItem(withTitle: "Quit", action: #selector(quitApp), keyEquivalent: "")
         quit.target = self
         statusItem.menu = menu
         trail.start()
