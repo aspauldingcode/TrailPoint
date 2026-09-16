@@ -205,12 +205,12 @@ final class TrailOverlayView: NSView {
             ring.position = point
             let path = CGMutablePath()
             path.addEllipse(in: ring.bounds)
-            path.addEllipse(in: ring.bounds.insetBy(dx: 3.5, dy: 3.5))
+            path.addEllipse(in: ring.bounds.insetBy(dx: 6.0, dy: 6.0))
             ring.path = path
             ring.fillRule = .evenOdd
             ring.fillColor = NSColor.windowBackgroundColor.cgColor
             ring.strokeColor = NSColor.white.cgColor
-            ring.lineWidth = 0.8
+            ring.lineWidth = 0.4
             layer?.addSublayer(ring)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { ring.removeFromSuperlayer() }
     }
