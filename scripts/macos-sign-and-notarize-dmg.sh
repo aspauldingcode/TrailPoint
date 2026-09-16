@@ -133,17 +133,14 @@ if [[ -n "$PKG" ]]; then
 fi
 
 if [[ -d "$STAGING" ]]; then
-  [[ -e "$STAGING/Applications" ]] || ln -s /Applications "$STAGING/Applications"
   if [[ ! -f "$STAGING/README.txt" ]]; then
     {
       echo 'TrailPoint macOS install'
       echo '========================'
-      echo 'Option A (app only): drag TrailPoint.app into Applications.'
-      echo 'Option B (recommended): double-click TrailPointAgent.pkg to install'
-      echo '  TrailPoint.app and set it up to launch automatically on login.'
+      echo 'Double-click TrailPointAgent.pkg to install'
+      echo 'TrailPoint.app and set it up to launch automatically on login.'
     } >"$STAGING/README.txt"
   fi
-  [[ -d "$STAGING/TrailPoint.app" ]] || { echo "error: $STAGING/TrailPoint.app missing" >&2; exit 1; }
   echo "Building DMG from $STAGING → $DMG"
   rm -f "$DMG"
   hdiutil create -volname "TrailPoint" -srcfolder "$STAGING" \

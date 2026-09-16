@@ -35,10 +35,9 @@ jobs:
           fi
           echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
           mkdir -p dmg-staging
-          ditto TrailPoint.app dmg-staging/TrailPoint.app
           chmod +x ./scripts/macos-sign-and-notarize-dmg.sh
           ./scripts/macos-sign-and-notarize-dmg.sh \
-            --app dmg-staging/TrailPoint.app \
+            --app TrailPoint.app \
             --pkg dmg-staging/TrailPointAgent.pkg \
             --dmg "TrailPoint-${VERSION}.dmg" \
             --staging dmg-staging \
