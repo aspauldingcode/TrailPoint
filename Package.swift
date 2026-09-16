@@ -10,7 +10,8 @@ let package = Package(
         path: ".",
         exclude: [
             "README.md", "USAGE.md", "LICENSE", "AppInfo.plist", "TrailPoint.entitlements",
-            "build-app.sh", "TrailPoint.app", "AppIcon.icon", "AppIcon.icns", "scripts", "Media"
+            "build-app.sh", "TrailPoint.app", "AppIcon.icon", "AppIcon.icns", "scripts", "Media",
+            "VERSION"
         ],
         sources: ["Main.swift"]
     )]
