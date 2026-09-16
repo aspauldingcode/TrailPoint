@@ -27,7 +27,8 @@ struct TrailSettings: Codable, Equatable {
     var enhancePrecision = true
     var snapToDefaultButton = false
     var displayTrails = true
-    var trailLength = 11.0
+    // Total visible cursors, including the real cursor: Windows-style 2…7.
+    var trailLength = 7.0
     var hidePointerWhileTyping = true
     var showLocationWithControl = true
 }
@@ -47,6 +48,7 @@ final class SettingsStore: ObservableObject {
         draft = saved
         active = saved
         loadMacMouseSettings(into: &saved)
+        saved.trailLength = min(7, max(2, saved.trailLength))
         draft = saved
         active = saved
     }
@@ -170,13 +172,21 @@ final class TrailOverlayView: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() { layer?.backgroundColor = NSColor.clear.cgColor }
 
-    func addPointer(at point: CGPoint, lifetime: CFTimeInterval) {
-        let cursor = NSCursor.currentSystem ?? NSCursor.arrow
-        let image = cursor.image
-        let size = image.size
-        let hotSpot = cursor.hotSpot
+    @discardableResult
+    func addPointer(at point: CGPoint) -> CALayer {
         let pointer = CALayer()
-        pointer.contents = image
+        positionPointer(pointer, at: point)
+        // Windows trail ghosts are full-strength cursor images, removed together on delay.
+        pointer.opacity = 1
+        layer?.addSublayer(pointer)
+        return pointer
+    }
+
+    func positionPointer(_ pointer: CALayer, at point: CGPoint) {
+        let cursor = NSCursor.currentSystem ?? NSCursor.arrow
+        let size = cursor.image.size
+        let hotSpot = cursor.hotSpot
+        pointer.contents = cursor.image
         pointer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
         pointer.frame = CGRect(
             x: point.x - hotSpot.x,
@@ -184,10 +194,6 @@ final class TrailOverlayView: NSView {
             width: size.width,
             height: size.height
         )
-        // Windows trail ghosts are full-strength cursor images, removed together on delay.
-        pointer.opacity = 1
-        layer?.addSublayer(pointer)
-        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { pointer.removeFromSuperlayer() }
     }
 
     func showLocator(at point: CGPoint) {
@@ -226,11 +232,15 @@ final class MouseTrailController {
     private var controlWasPressed = false
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
+    private var pointerPollTimer: Timer?
     private var snapTimer: Timer?
     private var lastSnappedTarget: String?
     private var hasShownSnapGrantedAlert = false
-    // Windows uses widely spaced cursor stamps rather than sampling every display frame.
-    private let sampleInterval: TimeInterval = 1.0 / 30.0
+    private var activeTrailPointers: [CALayer] = []
+    // A modest, live-position cadence keeps the newest ghost visually attached
+    // to the hardware cursor.  Display-link callbacks arrive after a compositor
+    // step on macOS, which made the entire trail sit behind the real pointer.
+    private let pointerPollInterval: TimeInterval = 1.0 / 24.0
     var isRunning = false
 
     init(settings: SettingsStore) {
@@ -246,6 +256,16 @@ final class MouseTrailController {
         rebuildOverlays()
         overlays.forEach { $0.orderFrontRegardless() }
         installEventTap()
+        pointerPollTimer = Timer.scheduledTimer(
+            timeInterval: pointerPollInterval,
+            target: self,
+            selector: #selector(pointerPollFired(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+        if let pointerPollTimer {
+            RunLoop.main.add(pointerPollTimer, forMode: .common)
+        }
         configureSnapToDefaultButton(enabled: settings.active.snapToDefaultButton, requestPermission: false)
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .flagsChanged, .keyDown]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
@@ -268,11 +288,14 @@ final class MouseTrailController {
         if let eventTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes) }
         eventTap = nil
         eventTapSource = nil
+        pointerPollTimer?.invalidate()
+        pointerPollTimer = nil
         snapTimer?.invalidate()
         snapTimer = nil
         lastSnappedTarget = nil
         overlays.forEach { $0.orderOut(nil) }
         overlays.removeAll()
+        clearTrailPointers()
         NotificationCenter.default.removeObserver(self)
         lastPoint = nil
     }
@@ -290,9 +313,11 @@ final class MouseTrailController {
             controlChanged(event.modifierFlags.contains(.control))
         } else if event.type == .keyDown && settings.active.hidePointerWhileTyping {
             NSCursor.setHiddenUntilMouseMoves(true)
-        } else {
-            recordPointerLocation()
         }
+    }
+
+    @objc private func pointerPollFired(_ timer: Timer) {
+        recordPointerLocation()
     }
 
     private func installEventTap() {
@@ -339,13 +364,16 @@ final class MouseTrailController {
             guard !hasShownSnapGrantedAlert else { return }
             hasShownSnapGrantedAlert = true
             let alert = NSAlert()
+            alert.icon = NSApp.applicationIconImage
             alert.messageText = "Granted"
+            alert.informativeText = "TrailPoint has Accessibility access. Snap To uses it to find the default button in dialog boxes and move the pointer to it."
             alert.addButton(withTitle: "OK")
             alert.runModal()
             return
         }
 
         let alert = NSAlert()
+        alert.icon = NSApp.applicationIconImage
         alert.messageText = "Grant TrailPoint Accessibility access"
         alert.informativeText = "Without it, macOS prevents reading other apps’ dialog controls."
         alert.addButton(withTitle: "Grant Access")
@@ -456,14 +484,35 @@ final class MouseTrailController {
     private func recordPointerLocation() {
         guard settings.active.displayTrails else { return }
         let now = Date()
-        guard now.timeIntervalSince(lastDrawTime) >= sampleInterval else { return }
         let point = NSEvent.mouseLocation
         defer { lastPoint = point; lastDrawTime = now }
         guard let previousPoint = lastPoint else { return }
         let distance = hypot(point.x - previousPoint.x, point.y - previousPoint.y)
-        guard distance > 1.5, let overlay = overlays.first(where: { $0.frame.contains(previousPoint) }), let view = overlay.contentView as? TrailOverlayView else { return }
-        let lifetime = 0.14 + settings.active.trailLength * 0.035
-        view.addPointer(at: CGPoint(x: previousPoint.x - overlay.frame.minX, y: previousPoint.y - overlay.frame.minY), lifetime: lifetime)
+        guard distance > 1.5 else { return }
+        // Stamp the live position. Drawing the prior sample added a full 40 ms
+        // of perceptible lag and made the trail appear detached from the cursor.
+        guard let overlay = overlays.first(where: { $0.frame.contains(point) }), let view = overlay.contentView as? TrailOverlayView else { return }
+        // Trail length is the total count including the real cursor, so keep
+        // only one through six ghost cursors on screen at any moment.
+        let maximumGhosts = max(1, min(6, Int(settings.active.trailLength.rounded()) - 1))
+        activeTrailPointers.removeAll { $0.superlayer == nil }
+        while activeTrailPointers.count >= maximumGhosts {
+            activeTrailPointers.removeFirst().removeFromSuperlayer()
+        }
+        let pointer = view.addPointer(at: CGPoint(x: point.x - overlay.frame.minX, y: point.y - overlay.frame.minY))
+        activeTrailPointers.append(pointer)
+        // A full six-ghost trail clears in under 0.3 seconds, rather than
+        // lingering for the old half-second delay.
+        let lifetime = 0.075 + Double(maximumGhosts) * 0.035
+        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self, weak pointer] in
+            pointer?.removeFromSuperlayer()
+            self?.activeTrailPointers.removeAll { $0 === pointer }
+        }
+    }
+
+    private func clearTrailPointers() {
+        activeTrailPointers.forEach { $0.removeFromSuperlayer() }
+        activeTrailPointers.removeAll()
     }
 
     private func showLocator(at point: CGPoint) {
@@ -539,7 +588,7 @@ struct PointerOptionsView: View {
                             PointerTrailIcon().frame(width: 42, height: 48)
                             VStack(alignment: .leading, spacing: 6) {
                                 Toggle("Display pointer trails", isOn: binding(\.displayTrails))
-                                speedSlider(label: "Short", value: binding(\.trailLength), range: 1...20, trailing: "Long")
+                                speedSlider(label: "Short", value: binding(\.trailLength), range: 2...7, trailing: "Long", usesNativeValueHint: true)
                                     .disabled(!store.draft.displayTrails)
                             }
                         }
@@ -562,13 +611,47 @@ struct PointerOptionsView: View {
         .frame(width: 400, height: 455)
     }
 
-    private func speedSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>, trailing: String, onChange: (() -> Void)? = nil) -> some View {
+    private func speedSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>, trailing: String, onChange: (() -> Void)? = nil, usesNativeValueHint: Bool = false) -> some View {
         HStack(spacing: 5) {
             Text(label).frame(width: 31, alignment: .leading)
-            Slider(value: value, in: range, step: 1).frame(width: 132)
+            if usesNativeValueHint {
+                NativeHintSlider(value: value, range: range).frame(width: 132, height: 18)
+            } else {
+                Slider(value: value, in: range, step: 1).frame(width: 132)
+            }
             Text(trailing).frame(width: 35, alignment: .trailing)
         }
         .onChange(of: value.wrappedValue) { _ in onChange?() }
+    }
+}
+
+/// An AppKit slider places macOS's native hover hint on the actual control,
+/// including its thumb, rather than on SwiftUI's surrounding layout view.
+private struct NativeHintSlider: NSViewRepresentable {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+
+    func makeCoordinator() -> Coordinator { Coordinator(value: $value) }
+
+    func makeNSView(context: Context) -> NSSlider {
+        let slider = NSSlider(value: value, minValue: range.lowerBound, maxValue: range.upperBound, target: context.coordinator, action: #selector(Coordinator.changed(_:)))
+        slider.allowsTickMarkValuesOnly = true
+        slider.numberOfTickMarks = Int(range.upperBound - range.lowerBound) + 1
+        slider.tickMarkPosition = .below
+        slider.toolTip = String(Int(value.rounded()))
+        return slider
+    }
+
+    func updateNSView(_ slider: NSSlider, context: Context) {
+        slider.doubleValue = value
+        slider.toolTip = String(Int(value.rounded()))
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        @Binding var value: Double
+        init(value: Binding<Double>) { _value = value }
+        @objc func changed(_ sender: NSSlider) { value = sender.doubleValue.rounded() }
     }
 }
 
