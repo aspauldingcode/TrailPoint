@@ -371,6 +371,15 @@ final class MouseTrailController {
 
         let key = "\(application.processIdentifier):\(windowNumber(target.container) ?? -1):\(Int(target.frame.midX)): \(Int(target.frame.midY))"
         guard key != lastSnappedTarget else { return }
+
+        // Do not warp the cursor if the user is currently holding the mouse down
+        // (e.g., dragging the window). We still update lastSnappedTarget so the
+        // cursor doesn't jump immediately after the mouse is released.
+        guard !CGEventSource.buttonState(.combinedSessionState, button: .left) else {
+            lastSnappedTarget = key
+            return
+        }
+
         // Accessibility frames and CGWarpMouseCursorPosition both use Quartz's
         // global display coordinate space (origin at the upper-left).
         guard CGWarpMouseCursorPosition(CGPoint(x: target.frame.midX, y: target.frame.midY)) == .success else { return }
