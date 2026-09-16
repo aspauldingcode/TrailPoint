@@ -9,6 +9,13 @@ cp .build/release/TrailPoint TrailPoint.app/Contents/MacOS/TrailPoint
 cp AppInfo.plist TrailPoint.app/Contents/Info.plist
 cp AppIcon.icns TrailPoint.app/Contents/Resources/AppIcon.icns
 
+if [[ -f "VERSION" ]]; then
+  VERSION="$(cat VERSION)"
+  plutil -replace CFBundleShortVersionString -string "$VERSION" TrailPoint.app/Contents/Info.plist
+  plutil -replace CFBundleVersion -string "$VERSION" TrailPoint.app/Contents/Info.plist
+  echo "Set app version to $VERSION"
+fi
+
 identity="${CODESIGN_IDENTITY:-}"
 if [[ -z "$identity" ]]; then
   identity="$(security find-identity -v -p codesigning | awk -F '"' '/Developer ID Application.*Spaulding/ { print $2; exit }')"
@@ -34,5 +41,4 @@ else
   echo "Ad-hoc signed (no Developer ID identity found)"
 fi
 
-ditto -c -k --keepParent TrailPoint.app TrailPoint.zip
 echo "Built TrailPoint.app"

@@ -16,89 +16,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Require Developer ID certificate
-        env:
-          DEVELOPER_ID_APPLICATION_P12: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
-          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${DEVELOPER_ID_APPLICATION_P12:-}" || -z "${DEVELOPER_ID_P12_PASSWORD:-}" ]]; then
-            echo "Missing GitHub secrets for Alex Spaulding's Apple Developer ID."
-            echo "Add DEVELOPER_ID_APPLICATION_P12 (base64 of the .p12) and DEVELOPER_ID_P12_PASSWORD."
-            exit 1
-          fi
-
-      - name: Import Developer ID Application certificate
-        env:
-          DEVELOPER_ID_APPLICATION_P12: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
-          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
-        run: |
-          set -euo pipefail
-          KEYCHAIN="$RUNNER_TEMP/trailpoint-signing.keychain-db"
-          KPW="$(openssl rand -base64 32)"
-          CERT="$RUNNER_TEMP/developer-id.p12"
-          echo "$DEVELOPER_ID_APPLICATION_P12" | base64 --decode > "$CERT"
-          security create-keychain -p "$KPW" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KPW" "$KEYCHAIN"
-          security import "$CERT" -P "$DEVELOPER_ID_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KPW" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
-          rm -f "$CERT"
-          identity="$(security find-identity -v -p codesigning | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
-          if [[ -z "$identity" ]]; then
-            echo "Imported .p12 did not contain a Developer ID Application identity."
-            security find-identity -v -p codesigning
-            exit 1
-          fi
-          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
-          echo "Imported $identity"
-
-      - name: Build, sign, and zip
-        env:
-          REQUIRE_DEVELOPER_ID: "1"
+      - name: Build unsigned app
         run: ./build-app.sh
 
-      - name: Notarize and staple
+      - name: Package, deep-sign, and notarize DMG
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
+          DEVELOPER_ID_INSTALLER_P12_BASE64: ${{ secrets.DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
         run: |
           set -euo pipefail
-          if [[ -n "${APP_STORE_CONNECT_API_KEY_P8:-}" && -n "${APP_STORE_CONNECT_KEY_ID:-}" && -n "${APP_STORE_CONNECT_ISSUER_ID:-}" ]]; then
-            KEY="$RUNNER_TEMP/AuthKey.p8"
-            printf '%s\n' "$APP_STORE_CONNECT_API_KEY_P8" | sed 's/\\n/\n/g' > "$KEY"
-            if ! grep -q "BEGIN PRIVATE KEY" "$KEY"; then
-              echo "$APP_STORE_CONNECT_API_KEY_P8" | base64 --decode > "$KEY"
-            fi
-            xcrun notarytool submit TrailPoint.zip --wait \
-              --key "$KEY" --key-id "$APP_STORE_CONNECT_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID"
-            rm -f "$KEY"
-          elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
-            xcrun notarytool submit TrailPoint.zip --wait \
-              --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
-          else
-            echo "Missing notarization secrets. Add either:"
-            echo "  APP_STORE_CONNECT_API_KEY_P8, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID"
-            echo "or:"
-            echo "  APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID"
-            exit 1
-          fi
-          xcrun stapler staple TrailPoint.app
-          rm -f TrailPoint.zip
-          ditto -c -k --keepParent TrailPoint.app TrailPoint.zip
-          codesign --verify --deep --strict --verbose=2 TrailPoint.app
-          spctl --assess --type execute --verbose TrailPoint.app
-
-      - name: Name release zip
-        run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          mv TrailPoint.zip "TrailPoint-${VERSION}.zip"
-          echo "RELEASE_ZIP=TrailPoint-${VERSION}.zip" >> "$GITHUB_ENV"
+          if [[ "$VERSION" == "main" || -z "$VERSION" ]]; then
+            VERSION="$(cat VERSION)"
+          fi
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dmg-staging
+          ditto TrailPoint.app dmg-staging/TrailPoint.app
+          chmod +x ./scripts/macos-sign-and-notarize-dmg.sh
+          ./scripts/macos-sign-and-notarize-dmg.sh \
+            --app dmg-staging/TrailPoint.app \
+            --pkg dmg-staging/TrailPointAgent.pkg \
+            --dmg "TrailPoint-${VERSION}.dmg" \
+            --staging dmg-staging \
+            --version "$VERSION"
+          echo "RELEASE_DMG=TrailPoint-${VERSION}.dmg" >> "$GITHUB_ENV"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -106,10 +51,11 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: TrailPoint ${{ github.ref_name }}
           generate_release_notes: true
-          files: ${{ env.RELEASE_ZIP }}
+          files: ${{ env.RELEASE_DMG }}
           fail_on_unmatched_files: true
           draft: false
           body: |
             Developer ID–signed and notarized TrailPoint for macOS.
 
-            Signed with Alex Spaulding’s Apple Developer identity. Gatekeeper should accept the zip after unzipping `TrailPoint.app`.
+            Signed with Alex Spaulding’s Apple Developer identity. 
+            Open the `.dmg` to drag `TrailPoint.app` to your Applications folder, or double click the `TrailPointAgent.pkg` to install the app and automatically configure it to start at login.
