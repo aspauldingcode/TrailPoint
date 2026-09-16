@@ -171,7 +171,7 @@ final class TrailOverlayView: NSView {
     override func updateLayer() { layer?.backgroundColor = NSColor.clear.cgColor }
 
     func addPointer(at point: CGPoint, lifetime: CFTimeInterval) {
-        let cursor = NSCursor.arrow
+        let cursor = NSCursor.currentSystem ?? NSCursor.arrow
         let image = cursor.image
         let size = image.size
         let hotSpot = cursor.hotSpot
