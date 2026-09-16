@@ -57,4 +57,4 @@ jobs:
             Developer ID–signed and notarized TrailPoint for macOS.
 
             Signed with Alex Spaulding’s Apple Developer identity. 
-            Open the `.dmg` to drag `TrailPoint.app` to your Applications folder, or double click the `TrailPointAgent.pkg` to install the app and automatically configure it to start at login.
+            Open the `.dmg` and double-click `TrailPointAgent.pkg` to install the app and automatically configure it to start at login.
