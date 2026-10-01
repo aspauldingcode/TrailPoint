@@ -49,12 +49,9 @@ jobs:
         with:
           tag_name: v${{ env.RELEASE_VERSION }}
           name: TrailPoint ${{ env.RELEASE_VERSION }}
-          generate_release_notes: true
+          generate_release_notes: false
           files: ${{ env.RELEASE_DMG }}
           fail_on_unmatched_files: true
           draft: false
           body: |
-            Developer ID–signed and notarized TrailPoint for macOS.
-
-            Signed with Alex Spaulding’s Apple Developer identity. 
-            Open the `.dmg` and double-click `TrailPointAgent.pkg` to install the app and automatically configure it to start at login.
+            Download the DMG to install TrailPoint.
