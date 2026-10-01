@@ -54,4 +54,6 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           body: |
+            <img src="https://raw.githubusercontent.com/aspauldingcode/TrailPoint/v${{ env.RELEASE_VERSION }}/Media/AppIcon.png" alt="TrailPoint" width="96">
+
             Download the DMG to install TrailPoint.
