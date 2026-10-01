@@ -41,6 +41,7 @@ final class SettingsStore: ObservableObject {
     /// `true` when this was an explicit user toggle, so the controller may ask for
     /// Accessibility permission rather than prompting merely because the app launched.
     var onSnapToDefaultButtonChange: ((Bool, Bool) -> Void)?
+    var onHidePointerWhileTypingChange: ((Bool) -> Void)?
     private let key = "TrailPoint.settings"
 
     init() {
@@ -58,6 +59,7 @@ final class SettingsStore: ObservableObject {
         if let data = try? JSONEncoder().encode(active) { UserDefaults.standard.set(data, forKey: key) }
         applyMacMouseSettings(active)
         onApply?(active)
+        onHidePointerWhileTypingChange?(active.hidePointerWhileTyping)
         // Recheck on every Apply while Snap To is checked. This catches a
         // permission grant made moments earlier and a later revocation alike.
         onSnapToDefaultButtonChange?(active.snapToDefaultButton, active.snapToDefaultButton)
@@ -73,9 +75,11 @@ final class SettingsStore: ObservableObject {
         active.hidePointerWhileTyping = draft.hidePointerWhileTyping
         if let data = try? JSONEncoder().encode(active) { UserDefaults.standard.set(data, forKey: key) }
         if !active.hidePointerWhileTyping {
+            // This only clears TrailPoint's own AppKit request. Other apps can
+            // independently request hiding when they receive the next key.
             NSCursor.setHiddenUntilMouseMoves(false)
-            NSCursor.unhide()
         }
+        onHidePointerWhileTypingChange?(active.hidePointerWhileTyping)
     }
 
     func cancel() { draft = active }
@@ -233,10 +237,14 @@ final class MouseTrailController {
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var pointerPollTimer: Timer?
+    private var typingVisibilityTimer: Timer?
     private var snapTimer: Timer?
     private var lastSnappedTarget: String?
     private var hasShownSnapGrantedAlert = false
     private var activeTrailPointers: [CALayer] = []
+    private var typingVisibilityPointer: CALayer?
+    private var typingProxyIsActive = false
+    private var typingProxyAnchor: CGPoint?
     // A modest, live-position cadence keeps the newest ghost visually attached
     // to the hardware cursor.  Display-link callbacks arrive after a compositor
     // step on macOS, which made the entire trail sit behind the real pointer.
@@ -247,6 +255,9 @@ final class MouseTrailController {
         self.settings = settings
         settings.onSnapToDefaultButtonChange = { [weak self] enabled, userInitiated in
             self?.configureSnapToDefaultButton(enabled: enabled, requestPermission: userInitiated)
+        }
+        settings.onHidePointerWhileTypingChange = { [weak self] hidesPointer in
+            self?.configureTypingVisibility(hidesPointer: hidesPointer)
         }
     }
 
@@ -266,6 +277,7 @@ final class MouseTrailController {
         if let pointerPollTimer {
             RunLoop.main.add(pointerPollTimer, forMode: .common)
         }
+        configureTypingVisibility(hidesPointer: settings.active.hidePointerWhileTyping)
         configureSnapToDefaultButton(enabled: settings.active.snapToDefaultButton, requestPermission: false)
         let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .flagsChanged, .keyDown]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
@@ -290,12 +302,16 @@ final class MouseTrailController {
         eventTapSource = nil
         pointerPollTimer?.invalidate()
         pointerPollTimer = nil
+        typingVisibilityTimer?.invalidate()
+        typingVisibilityTimer = nil
         snapTimer?.invalidate()
         snapTimer = nil
         lastSnappedTarget = nil
         overlays.forEach { $0.orderOut(nil) }
         overlays.removeAll()
         clearTrailPointers()
+        typingVisibilityPointer?.removeFromSuperlayer()
+        typingVisibilityPointer = nil
         NotificationCenter.default.removeObserver(self)
         lastPoint = nil
     }
@@ -311,8 +327,77 @@ final class MouseTrailController {
         if event.type == .flagsChanged {
             // Fallback for Macs where a session event tap is not authorized yet.
             controlChanged(event.modifierFlags.contains(.control))
-        } else if event.type == .keyDown && settings.active.hidePointerWhileTyping {
-            NSCursor.setHiddenUntilMouseMoves(true)
+        } else if event.type == .keyDown {
+            if settings.active.hidePointerWhileTyping {
+                NSCursor.setHiddenUntilMouseMoves(true)
+            } else {
+                activateTypingVisibilityProxy()
+            }
+        } else if event.type == .mouseMoved || event.type == .leftMouseDragged || event.type == .rightMouseDragged || event.type == .otherMouseDragged {
+            deactivateTypingVisibilityProxy()
+        }
+    }
+
+    /// Keep a cursor copy only while the user is actually typing. A permanent
+    /// moving copy would visually become an extra trail cursor.
+    private func configureTypingVisibility(hidesPointer: Bool) {
+        typingVisibilityTimer?.invalidate()
+        typingVisibilityTimer = nil
+        guard !hidesPointer, isRunning else {
+            deactivateTypingVisibilityProxy()
+            return
+        }
+        typingVisibilityTimer = Timer.scheduledTimer(
+            timeInterval: 1.0 / 120.0,
+            target: self,
+            selector: #selector(typingVisibilityTimerFired(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+        if let typingVisibilityTimer {
+            RunLoop.main.add(typingVisibilityTimer, forMode: .common)
+        }
+    }
+
+    @objc private func typingVisibilityTimerFired(_ timer: Timer) {
+        guard typingProxyIsActive else { return }
+        updateTypingVisibilityPointer()
+    }
+
+    private func activateTypingVisibilityProxy() {
+        guard !settings.active.hidePointerWhileTyping else { return }
+        typingProxyIsActive = true
+        typingProxyAnchor = NSEvent.mouseLocation
+        updateTypingVisibilityPointer()
+    }
+
+    private func deactivateTypingVisibilityProxy() {
+        typingProxyIsActive = false
+        typingProxyAnchor = nil
+        typingVisibilityPointer?.removeFromSuperlayer()
+        typingVisibilityPointer = nil
+    }
+
+    private func updateTypingVisibilityPointer() {
+        guard typingProxyIsActive, !settings.active.hidePointerWhileTyping else { return }
+        let point = NSEvent.mouseLocation
+        if let typingProxyAnchor, hypot(point.x - typingProxyAnchor.x, point.y - typingProxyAnchor.y) > 0.1 {
+            deactivateTypingVisibilityProxy()
+            return
+        }
+        guard let overlay = overlays.first(where: { $0.frame.contains(point) }),
+              let view = overlay.contentView as? TrailOverlayView else { return }
+        let localPoint = CGPoint(x: point.x - overlay.frame.minX, y: point.y - overlay.frame.minY)
+        // The WindowServer cursor is raster-aligned one device pixel up-left of
+        // AppKit's sampled hotspot. Correct only the proxy so trail snapshots
+        // retain their Windows-style positions.
+        let pixel = 1.5 / max(1, overlay.backingScaleFactor)
+        let proxyPoint = CGPoint(x: localPoint.x - pixel, y: localPoint.y + pixel)
+        if let typingVisibilityPointer, typingVisibilityPointer.superlayer === view.layer {
+            view.positionPointer(typingVisibilityPointer, at: proxyPoint)
+        } else {
+            typingVisibilityPointer?.removeFromSuperlayer()
+            typingVisibilityPointer = view.addPointer(at: proxyPoint)
         }
     }
 
@@ -321,9 +406,12 @@ final class MouseTrailController {
     }
 
     private func installEventTap() {
-        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
+        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
         let context = Unmanaged.passUnretained(self).toOpaque()
-        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask, callback: { proxy, type, event, userInfo in
+        // Tail placement makes our same-location mouse event follow the normal
+        // key-event path. At the head of the stream, some text controls could
+        // still issue their cursor-hide request after TrailPoint revealed it.
+        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .defaultTap, eventsOfInterest: mask, callback: { proxy, type, event, userInfo in
             guard let userInfo else { return Unmanaged.passUnretained(event) }
             let controller = Unmanaged<MouseTrailController>.fromOpaque(userInfo).takeUnretainedValue()
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -333,6 +421,12 @@ final class MouseTrailController {
             } else if type == .flagsChanged {
                 let controlIsPressed = event.flags.contains(.maskControl)
                 Task { @MainActor in controller.controlChanged(controlIsPressed) }
+            } else if type == .keyDown {
+                Task { @MainActor in
+                    if !controller.settings.active.hidePointerWhileTyping {
+                        controller.activateTypingVisibilityProxy()
+                    }
+                }
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: context)
@@ -812,7 +906,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quit.target = self
         statusItem.menu = menu
         trail.start()
-        showOptions()
     }
 
     func applicationWillTerminate(_ notification: Notification) { trail.stop() }
